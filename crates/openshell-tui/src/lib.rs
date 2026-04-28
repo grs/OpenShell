@@ -27,6 +27,17 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 
 use app::{App, Focus, GatewayEntry, LogLine, Screen};
 use event::{Event, EventHandler};
+use openshell_core::proto::provider::ProviderConfig;
+
+/// Helper to extract static credentials from a Provider.
+fn get_credentials(
+    provider: &openshell_core::proto::Provider,
+) -> std::collections::HashMap<String, String> {
+    match &provider.provider_config {
+        Some(ProviderConfig::Static(static_creds)) => static_creds.credentials.clone(),
+        _ => std::collections::HashMap::new(),
+    }
+}
 
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
@@ -183,17 +194,17 @@ pub async fn run(
             }
             Some(Event::ProviderDetailFetched(result)) => match result {
                 Ok(provider) => {
-                    let cred_key = provider
-                        .credentials
+                    let credentials = get_credentials(&provider);
+                    let cred_key = credentials
                         .keys()
                         .next()
                         .cloned()
                         .unwrap_or_default();
-                    let masked = provider
-                        .credentials
-                        .values()
-                        .next()
-                        .map_or_else(|| "-".to_string(), |val| mask_secret(val));
+                    let masked = if let Some(val) = credentials.values().next() {
+                        mask_secret(val)
+                    } else {
+                        "-".to_string()
+                    };
                     app.provider_detail = Some(app::ProviderDetailView {
                         name: provider.object_name().to_string(),
                         provider_type: provider.r#type.clone(),
@@ -1559,8 +1570,12 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         labels: HashMap::new(),
                     }),
                     r#type: ptype.clone(),
-                    credentials: credentials.clone(),
-                    config: HashMap::default(),
+                    provider_config: Some(ProviderConfig::Static(
+                        openshell_core::proto::StaticCredentials {
+                            credentials: credentials.clone(),
+                        },
+                    )),
+                    config: Default::default(),
                 }),
             };
 
@@ -1649,8 +1664,12 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     labels: HashMap::new(),
                 }),
                 r#type: ptype,
-                credentials,
-                config: HashMap::default(),
+                provider_config: Some(ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials,
+                    },
+                )),
+                config: Default::default(),
             }),
         };
 
@@ -1882,7 +1901,7 @@ async fn refresh_providers(app: &mut App) {
             app.provider_cred_keys = providers
                 .iter()
                 .map(|p| {
-                    p.credentials
+                    get_credentials(p)
                         .keys()
                         .next()
                         .cloned()

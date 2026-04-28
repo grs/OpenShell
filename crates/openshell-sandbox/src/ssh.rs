@@ -699,7 +699,9 @@ fn apply_child_env(
         }
     }
 
+    tracing::info!("SSH: injecting {} provider environment variables", provider_env.len());
     for (key, value) in provider_env {
+        tracing::info!("SSH: setting env {} = {}", key, value);
         cmd.env(key, value);
     }
 }

@@ -177,6 +177,7 @@ use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
+use crate::secrets::{SecretResolver, SecretRetriever};
 pub use process::{ProcessHandle, ProcessStatus};
 pub use sandbox::apply_supervisor_startup_hardening;
 
@@ -348,49 +349,104 @@ pub async fn run_sandbox(
     #[cfg(unix)]
     validate_sandbox_user(&policy)?;
 
-    // Fetch provider environment variables from the server.
+    // Fetch provider environment from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let (provider_env_revision, provider_env) =
-        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match grpc_client::fetch_provider_environment(endpoint, id).await {
-                Ok(result) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .message(format!(
-                                "Fetched provider environment [env_count:{}]",
-                                result.environment.len()
-                            ))
-                            .build()
-                    );
-                    (result.provider_env_revision, result.environment)
-                }
-                Err(e) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Other, "degraded")
-                            .message(format!(
-                                "Failed to fetch provider environment, continuing without: {e}"
-                            ))
-                            .build()
-                    );
-                    (0, std::collections::HashMap::new())
-                }
+    let provider_response = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+        match grpc_client::fetch_provider_environment(endpoint, id).await {
+            Ok(response) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "loaded")
+                        .message(format!(
+                            "Fetched provider environment [static_count:{}, dynamic_count:{}]",
+                            response.static_environment.len(),
+                            response.dynamic_providers.len()
+                        ))
+                        .build()
+                );
+                response
             }
-        } else {
-            (0, std::collections::HashMap::new())
-        };
+            Err(e) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "degraded")
+                        .message(format!(
+                            "Failed to fetch provider environment, continuing without: {e}"
+                        ))
+                        .build()
+                );
+                openshell_core::proto::GetSandboxProviderEnvironmentResponse::default()
+            }
+        }
+    } else {
+        openshell_core::proto::GetSandboxProviderEnvironmentResponse::default()
+    };
 
-    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
-        provider_env_revision,
-        provider_env,
-    );
-    let provider_env = provider_credentials.snapshot().child_env.clone();
+    // Static credentials → placeholders
+    let (static_env, secret_resolver) =
+        SecretResolver::from_provider_env(provider_response.static_environment);
+    let secret_resolver = secret_resolver.map(Arc::new);
+
+    // Dynamic providers → async token retriever
+    let secret_retriever = if !provider_response.dynamic_providers.is_empty() {
+        match SecretRetriever::new(provider_response.dynamic_providers).await {
+            Ok(retriever) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "enabled")
+                        .message(format!(
+                            "Initialized dynamic token retriever [provider_count:{}]",
+                            retriever.provider_count()
+                        ))
+                        .build()
+                );
+                Some(Arc::new(retriever))
+            }
+            Err(e) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "disabled")
+                        .message(format!(
+                            "Failed to initialize token retriever, dynamic providers disabled: {e}"
+                        ))
+                        .build()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Merge environments: static placeholders + dynamic placeholders
+    let mut provider_env = static_env;
+    if let Some(retriever) = &secret_retriever {
+        let placeholders = retriever.placeholders();
+        tracing::info!(
+            "merging {} dynamic provider placeholders into sandbox environment",
+            placeholders.len()
+        );
+        for placeholder in placeholders {
+            tracing::info!(
+                "adding dynamic placeholder: {} = {}",
+                placeholder.key,
+                placeholder.value
+            );
+            provider_env.insert(placeholder.key.clone(), placeholder.value.clone());
+        }
+    }
+
+    // Create ProviderCredentialState for SSH server and policy poll loop
+    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(0, provider_env.clone());
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -609,8 +665,8 @@ pub async fn run_sandbox(
             entrypoint_pid.clone(),
             tls_state,
             inference_ctx,
-            Some(provider_credentials.clone()),
-            Some(policy_local_ctx.clone()),
+            secret_resolver.clone(),
+            secret_retriever.clone(),
             denial_tx,
         )
         .await?;
@@ -2357,10 +2413,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
                 Ok(env_result) => {
                     let env_count = ctx.provider_credentials.install_environment(
-                        env_result.provider_env_revision,
-                        env_result.environment,
+                        0,
+                        env_result.static_environment,
                     );
-                    current_provider_env_revision = env_result.provider_env_revision;
+                    current_provider_env_revision = 0;
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)

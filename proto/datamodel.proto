@@ -29,9 +29,69 @@ message Provider {
   // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
   ObjectMeta metadata = 1;
   // Canonical provider type slug (for example: "claude", "gitlab").
-  string type = 2;
-  // Secret values used for authentication.
-  map<string, string> credentials = 3;
+  string type = 3;
+
+  // Provider configuration mode
+  oneof provider_config {
+    // Static credentials (stored in gateway)
+    StaticCredentials static = 4;
+
+    // Dynamic token retrieval configuration
+    TokenProviderConfig token = 5;
+  }
+
   // Non-secret provider configuration.
-  map<string, string> config = 4;
+  map<string, string> config = 6;
+}
+
+// Static credential configuration.
+message StaticCredentials {
+  // Secret values used for authentication.
+  map<string, string> credentials = 1;
+}
+
+// Dynamic token provider configuration.
+message TokenProviderConfig {
+  // Token service configuration
+  oneof service_config {
+    // User-provided token service endpoint and authentication
+    UserProvidedTokenService user_provided = 1;
+
+    // Use gateway's default token service (endpoint and auth from gateway config)
+    bool use_backend_default = 2;
+  }
+
+  // Token audience (aud claim) - always user-provided
+  string audience = 3;
+
+  // OAuth2 scopes to request - optional
+  repeated string scopes = 4;
+
+  // Environment variable names this provider serves (e.g., "GITHUB_TOKEN", "GH_TOKEN").
+  // If empty, inferred from provider type using ProviderPlugin::credential_env_vars().
+  repeated string env_keys = 5;
+
+  // Additional metadata (e.g., grant_type overrides, custom parameters).
+  map<string, string> metadata = 6;
+}
+
+// User-provided token service configuration.
+message UserProvidedTokenService {
+  // OAuth2 token endpoint URL
+  string token_endpoint = 1;
+
+  // Authentication method for token endpoint
+  oneof authentication {
+    // Client credentials (client_id + client_secret)
+    ClientCredentials client_credentials = 2;
+
+    // Use SPIFFE JWT-SVID from Workload API
+    bool use_spiffe = 3;
+  }
+}
+
+// OAuth2 client credentials.
+message ClientCredentials {
+  string client_id = 1;
+  string client_secret = 2;
 }

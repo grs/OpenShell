@@ -455,6 +455,396 @@ pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String 
     }
 }
 
+/// Derive SPIFFE audience from Keycloak token endpoint.
+///
+/// For Keycloak token endpoints like:
+/// `http://keycloak/realms/openshell/protocol/openid-connect/token`
+///
+/// The SPIFFE audience should be:
+/// `http://keycloak/realms/openshell`
+///
+/// This is a temporary workaround until we add proper configuration for SPIFFE audiences.
+fn derive_spiffe_audience(token_endpoint: &str) -> Option<String> {
+    // Find "/realms/" in the URL
+    let realms_pos = token_endpoint.find("/realms/")?;
+
+    // Find the next "/" after "/realms/<realm>"
+    let after_realms = &token_endpoint[realms_pos + "/realms/".len()..];
+    let next_slash = after_realms.find('/')?;
+
+    // Extract everything up to and including "/realms/<realm>"
+    let audience = &token_endpoint[..realms_pos + "/realms/".len() + next_slash];
+    Some(audience.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// SecretRetriever (async, dynamic token providers)
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Cached token with expiration.
+#[derive(Debug, Clone)]
+struct CachedToken {
+    value: String,
+    expires_at: std::time::Instant,
+}
+
+/// Authentication method for token endpoint.
+#[derive(Debug, Clone)]
+enum TokenAuthentication {
+    /// OAuth2 client credentials (client_id + client_secret)
+    ClientCredentials { client_id: String, client_secret: String },
+    /// SPIFFE JWT-SVID from Workload API
+    Spiffe { audience: String },
+}
+
+/// Token provider for a single dynamic provider.
+struct TokenProvider {
+    provider_name: String,
+    provider_type: String,
+    env_keys: Vec<String>,
+    token_endpoint: String,
+    audience: String,
+    scopes: Vec<String>,
+    authentication: TokenAuthentication,
+    cache: Arc<RwLock<Option<CachedToken>>>,
+}
+
+impl TokenProvider {
+    async fn new(
+        provider_name: String,
+        provider_type: String,
+        env_keys: Vec<String>,
+        token_config: &openshell_core::proto::TokenProviderConfig,
+    ) -> Result<Self, String> {
+        use openshell_core::proto::token_provider_config::ServiceConfig;
+        use openshell_core::proto::user_provided_token_service::Authentication;
+
+        // Extract service config
+        let service = match &token_config.service_config {
+            Some(ServiceConfig::UserProvided(s)) => s,
+            _ => {
+                return Err(format!(
+                    "provider {} has invalid service_config (expected user_provided)",
+                    provider_name
+                ));
+            }
+        };
+
+        let token_endpoint = service.token_endpoint.clone();
+
+        // Determine authentication method
+        let authentication = match &service.authentication {
+            Some(Authentication::ClientCredentials(creds)) => {
+                TokenAuthentication::ClientCredentials {
+                    client_id: creds.client_id.clone(),
+                    client_secret: creds.client_secret.clone(),
+                }
+            }
+            Some(Authentication::UseSpiffe(_)) | None => {
+                // Determine SPIFFE audience:
+                // 1. Use OPENSHELL_SPIFFE_JWT_AUDIENCE if set
+                // 2. Otherwise derive from token_endpoint
+                let spiffe_audience = if let Ok(env_audience) = std::env::var("OPENSHELL_SPIFFE_JWT_AUDIENCE") {
+                    if env_audience.is_empty() {
+                        return Err(format!(
+                            "provider {}: OPENSHELL_SPIFFE_JWT_AUDIENCE is set but empty",
+                            provider_name
+                        ));
+                    }
+                    env_audience
+                } else {
+                    derive_spiffe_audience(&token_endpoint)
+                        .ok_or_else(|| {
+                            format!(
+                                "provider {}: cannot derive SPIFFE audience from token_endpoint {} \
+                                 (set OPENSHELL_SPIFFE_JWT_AUDIENCE to override)",
+                                provider_name, token_endpoint
+                            )
+                        })?
+                };
+                TokenAuthentication::Spiffe { audience: spiffe_audience }
+            }
+        };
+
+        Ok(Self {
+            provider_name,
+            provider_type,
+            env_keys,
+            token_endpoint,
+            audience: token_config.audience.clone(),
+            scopes: token_config.scopes.clone(),
+            authentication,
+            cache: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    /// Fetch a token from the cache or token endpoint.
+    ///
+    /// Uses a 5-minute buffer to refresh tokens before they expire.
+    async fn get_token(&self) -> Result<String, String> {
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.as_ref() {
+                if cached.expires_at > std::time::Instant::now() {
+                    return Ok(cached.value.clone());
+                }
+            }
+        }
+
+        // Cache miss or expired — fetch new token
+        let token = self.fetch_token().await?;
+
+        // Cache the new token
+        {
+            let mut cache = self.cache.write().await;
+            *cache = Some(token.clone());
+        }
+
+        Ok(token.value)
+    }
+
+    /// Fetch a new token from the token endpoint using OAuth2 client credentials grant.
+    async fn fetch_token(&self) -> Result<CachedToken, String> {
+        tracing::info!("fetch_token: requesting token from {}", self.token_endpoint);
+        let client = reqwest::Client::new();
+
+        let mut form = vec![
+            ("grant_type", "client_credentials".to_string()),
+            ("audience", self.audience.clone()),
+        ];
+
+        if !self.scopes.is_empty() {
+            form.push(("scope", self.scopes.join(" ")));
+        }
+
+        match &self.authentication {
+            TokenAuthentication::ClientCredentials { client_id, client_secret } => {
+                tracing::info!("fetch_token: using client credentials with client_id {}", client_id);
+                form.push(("client_id", client_id.clone()));
+                form.push(("client_secret", client_secret.clone()));
+            }
+            TokenAuthentication::Spiffe { audience } => {
+                // Fetch JWT-SVID from SPIFFE Workload API for this specific audience
+                let (jwt, client_id) = Self::fetch_spiffe_jwt_svid(audience).await?;
+                tracing::info!(
+                    "fetch_token: using SPIFFE JWT-SVID [client_id:{} audience:{}]",
+                    client_id,
+                    audience
+                );
+                form.push(("client_id", client_id));
+                form.push(("client_assertion", jwt));
+                form.push(("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe".to_string()));
+            }
+        }
+
+        let response = client
+            .post(&self.token_endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| format!("token fetch failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("token endpoint returned {status}: {body}"));
+        }
+
+        let token_response: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("failed to parse token response: {e}"))?;
+
+        let access_token = token_response
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing access_token in response".to_string())?
+            .to_string();
+
+        let expires_in = token_response
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600);
+
+        // Use a 5-minute buffer to refresh before expiration
+        let buffer_secs = 300;
+        let ttl_secs = expires_in.saturating_sub(buffer_secs).max(60);
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs);
+
+        Ok(CachedToken {
+            value: access_token,
+            expires_at,
+        })
+    }
+
+    /// Fetch a JWT-SVID from the SPIFFE Workload API for a specific audience.
+    ///
+    /// Returns (jwt_token, spiffe_id).
+    async fn fetch_spiffe_jwt_svid(audience: &str) -> Result<(String, String), String> {
+        // Check if SPIFFE should be used
+        if !Self::should_use_spiffe() {
+            return Err("SPIFFE Workload API not available".to_string());
+        }
+
+        // Create JWT source (connects to workload API socket)
+        let jwt_source = spiffe::JwtSource::new()
+            .await
+            .map_err(|e| format!("failed to connect to SPIFFE Workload API: {e}"))?;
+
+        // Fetch JWT-SVID with the specified audience
+        let jwt_svid = jwt_source
+            .get_jwt_svid(&[audience])
+            .await
+            .map_err(|e| format!("failed to fetch JWT-SVID from Workload API: {e}"))?;
+
+        let jwt = jwt_svid.token().to_string();
+        let spiffe_id = jwt_svid.spiffe_id().to_string();
+
+        Ok((jwt, spiffe_id))
+    }
+
+    /// Check if SPIFFE Workload API should be used.
+    fn should_use_spiffe() -> bool {
+        // Explicit enable
+        if std::env::var("OPENSHELL_SPIFFE_ENABLED")
+            .ok()
+            .as_deref() == Some("true")
+        {
+            return true;
+        }
+
+        // Check if socket exists
+        let socket_path = std::env::var("SPIFFE_ENDPOINT_SOCKET")
+            .unwrap_or_else(|_| "unix:///run/spire/agent-sockets/spire-agent.sock".to_string());
+
+        // Strip unix:// prefix if present (the env var is a URI, but we need a file path)
+        let file_path = socket_path
+            .strip_prefix("unix://")
+            .unwrap_or(&socket_path);
+
+        std::path::Path::new(file_path).exists()
+    }
+}
+
+/// Placeholder for a dynamic provider environment variable.
+#[derive(Debug, Clone)]
+pub struct Placeholder {
+    pub key: String,
+    pub value: String,
+}
+
+/// Async resolver for dynamic token providers.
+///
+/// Handles OAuth2 client credentials grant for fetching provider tokens on-demand.
+pub struct SecretRetriever {
+    providers: Vec<Arc<TokenProvider>>,
+    placeholders: Vec<Placeholder>,
+}
+
+impl SecretRetriever {
+    /// Create a new `SecretRetriever` from dynamic provider configurations.
+    ///
+    /// Initializes token providers with their authentication methods.
+    pub async fn new(
+        dynamic_providers: Vec<openshell_core::proto::DynamicProviderConfig>,
+    ) -> Result<Self, String> {
+        if dynamic_providers.is_empty() {
+            return Ok(Self {
+                providers: Vec::new(),
+                placeholders: Vec::new(),
+            });
+        }
+
+        let mut providers = Vec::with_capacity(dynamic_providers.len());
+        let mut placeholders = Vec::new();
+
+        for config in dynamic_providers {
+            let token_config = config.token_config.ok_or_else(|| {
+                format!("missing token_config for provider {}", config.provider_name)
+            })?;
+
+            let provider = Arc::new(
+                TokenProvider::new(
+                    config.provider_name.clone(),
+                    config.provider_type.clone(),
+                    config.env_keys.clone(),
+                    &token_config,
+                )
+                .await?,
+            );
+
+            // Generate placeholders for each env_key
+            for key in &config.env_keys {
+                placeholders.push(Placeholder {
+                    key: key.clone(),
+                    value: placeholder_for_env_key(key),
+                });
+            }
+
+            providers.push(provider);
+        }
+
+        Ok(Self {
+            providers,
+            placeholders,
+        })
+    }
+
+    /// Return the number of dynamic providers.
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Return the list of placeholders for dynamic providers.
+    pub fn placeholders(&self) -> &[Placeholder] {
+        &self.placeholders
+    }
+
+    /// Resolve a placeholder to a token value.
+    ///
+    /// Returns `None` if the placeholder is unknown or token fetch fails.
+    pub async fn resolve_placeholder(&self, placeholder: &str) -> Option<String> {
+        // Extract the env key from the placeholder
+        let key = placeholder.strip_prefix(PLACEHOLDER_PREFIX)?;
+
+        // Find the provider that owns this key
+        for provider in &self.providers {
+            if provider.env_keys.contains(&key.to_string()) {
+                match provider.get_token().await {
+                    Ok(token) => {
+                        // Validate the token for control characters
+                        if validate_resolved_secret(&token).is_err() {
+                            tracing::warn!(
+                                location = "resolve_placeholder",
+                                provider = %provider.provider_name,
+                                key = %key,
+                                "dynamic token resolution rejected: token contains prohibited characters"
+                            );
+                            return None;
+                        }
+                        return Some(token);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "dynamic token fetch failed for provider {} key {}: {}",
+                            provider.provider_name,
+                            key,
+                            e
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Secret validation (F1 — CWE-113)
 // ---------------------------------------------------------------------------

@@ -241,6 +241,8 @@ pub(super) fn validate_string_map(
 
 /// Validate field sizes on a `Provider` before persisting.
 pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status> {
+    use openshell_core::proto::provider::ProviderConfig;
+
     let name_len = provider.metadata.as_ref().map_or(0, |m| m.name.len());
     if name_len > MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
@@ -253,13 +255,99 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
             provider.r#type.len()
         )));
     }
-    validate_string_map(
-        &provider.credentials,
-        MAX_PROVIDER_CREDENTIALS_ENTRIES,
-        MAX_MAP_KEY_LEN,
-        MAX_MAP_VALUE_LEN,
-        "provider.credentials",
-    )?;
+
+    // Validate provider configuration
+    if let Some(provider_config) = &provider.provider_config {
+        match provider_config {
+            ProviderConfig::Static(static_creds) => {
+                validate_string_map(
+                    &static_creds.credentials,
+                    MAX_PROVIDER_CREDENTIALS_ENTRIES,
+                    MAX_MAP_KEY_LEN,
+                    MAX_MAP_VALUE_LEN,
+                    "provider.credentials",
+                )?;
+            }
+            ProviderConfig::Token(token_config) => {
+                use openshell_core::proto::token_provider_config::ServiceConfig;
+                use openshell_core::proto::user_provided_token_service::Authentication;
+
+                // Validate service_config if user-provided
+                if let Some(ServiceConfig::UserProvided(user_provided)) = &token_config.service_config {
+                    // Validate token endpoint URL length
+                    if user_provided.token_endpoint.len() > MAX_MAP_VALUE_LEN {
+                        return Err(Status::invalid_argument(format!(
+                            "provider.token_endpoint exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                            user_provided.token_endpoint.len()
+                        )));
+                    }
+
+                    // Validate authentication config
+                    if let Some(Authentication::ClientCredentials(creds)) = &user_provided.authentication {
+                        if creds.client_id.len() > MAX_MAP_VALUE_LEN {
+                            return Err(Status::invalid_argument(format!(
+                                "provider.client_id exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                                creds.client_id.len()
+                            )));
+                        }
+                        if creds.client_secret.len() > MAX_MAP_VALUE_LEN {
+                            return Err(Status::invalid_argument(format!(
+                                "provider.client_secret exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                                creds.client_secret.len()
+                            )));
+                        }
+                    }
+                }
+
+                // Validate audience length
+                if token_config.audience.len() > MAX_MAP_VALUE_LEN {
+                    return Err(Status::invalid_argument(format!(
+                        "provider.audience exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                        token_config.audience.len()
+                    )));
+                }
+                // Validate scopes count and length
+                if token_config.scopes.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+                    return Err(Status::invalid_argument(format!(
+                        "provider.scopes exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+                        token_config.scopes.len()
+                    )));
+                }
+                for scope in &token_config.scopes {
+                    if scope.len() > MAX_MAP_VALUE_LEN {
+                        return Err(Status::invalid_argument(format!(
+                            "provider.scope exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                            scope.len()
+                        )));
+                    }
+                }
+                // Validate env_keys count and length
+                if token_config.env_keys.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+                    return Err(Status::invalid_argument(format!(
+                        "provider.env_keys exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+                        token_config.env_keys.len()
+                    )));
+                }
+                for env_key in &token_config.env_keys {
+                    if env_key.len() > MAX_MAP_KEY_LEN {
+                        return Err(Status::invalid_argument(format!(
+                            "provider.env_key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                            env_key.len()
+                        )));
+                    }
+                }
+                // Validate metadata
+                validate_string_map(
+                    &token_config.metadata,
+                    MAX_PROVIDER_CONFIG_ENTRIES,
+                    MAX_MAP_KEY_LEN,
+                    MAX_MAP_VALUE_LEN,
+                    "provider.metadata",
+                )?;
+            }
+        }
+    }
+
     validate_string_map(
         &provider.config,
         MAX_PROVIDER_CONFIG_ENTRIES,
@@ -924,6 +1012,17 @@ mod tests {
             .map(|i| (format!("K{i}"), "v".to_string()))
             .collect();
         let provider = make_test_provider("ok", "claude", creds, HashMap::new());
+        let provider = Provider {
+            id: String::new(),
+            name: "ok".to_string(),
+            r#type: "claude".to_string(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: creds,
+                }
+            )),
+            config: HashMap::new(),
+        };
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("provider.credentials"));

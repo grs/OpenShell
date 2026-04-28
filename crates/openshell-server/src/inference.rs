@@ -349,21 +349,36 @@ async fn verify_provider_endpoint(
 }
 
 fn find_provider_api_key(provider: &Provider, preferred_key_names: &[&str]) -> Option<String> {
+    use openshell_core::proto::provider::ProviderConfig;
+
+    // Gateway inference routing only supports static providers.
+    // Dynamic token providers require platform credentials and OAuth2 flow,
+    // which the gateway doesn't currently implement. This can be enhanced
+    // in the future to support dynamic tokens for inference routing.
+    let credentials = match &provider.provider_config {
+        Some(ProviderConfig::Static(static_creds)) => &static_creds.credentials,
+        Some(ProviderConfig::Token(_)) | None => {
+            return None;
+        }
+    };
+
+    // Try preferred key names first
     for key in preferred_key_names {
-        if let Some(value) = provider.credentials.get(*key)
-            && !value.trim().is_empty()
-        {
-            return Some(value.clone());
+        if let Some(value) = credentials.get(*key) {
+            if !value.trim().is_empty() {
+                return Some(value.clone());
+            }
         }
     }
 
-    let mut keys = provider.credentials.keys().collect::<Vec<_>>();
+    // Fall back to any available credential (sorted alphabetically)
+    let mut keys = credentials.keys().collect::<Vec<_>>();
     keys.sort();
     for key in keys {
-        if let Some(value) = provider.credentials.get(key)
-            && !value.trim().is_empty()
-        {
-            return Some(value.clone());
+        if let Some(value) = credentials.get(key) {
+            if !value.trim().is_empty() {
+                return Some(value.clone());
+            }
         }
     }
 
@@ -508,7 +523,11 @@ mod tests {
                 labels: std::collections::HashMap::new(),
             }),
             r#type: provider_type.to_string(),
-            credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
+                }
+            )),
             config: std::collections::HashMap::new(),
         }
     }
@@ -667,8 +686,12 @@ mod tests {
                 labels: std::collections::HashMap::new(),
             }),
             r#type: "openai".to_string(),
-            credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
-                .collect(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
+                        .collect(),
+                }
+            )),
             config: std::iter::once((
                 "OPENAI_BASE_URL".to_string(),
                 "https://station.example.com/v1".to_string(),
@@ -745,8 +768,12 @@ mod tests {
         let rotated_provider = Provider {
             metadata: provider.metadata.clone(),
             r#type: provider.r#type.clone(),
-            credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-rotated".to_string()))
-                .collect(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-rotated".to_string()))
+                        .collect(),
+                }
+            )),
             config: provider.config.clone(),
         };
         store

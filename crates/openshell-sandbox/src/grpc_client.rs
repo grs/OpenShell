@@ -10,8 +10,9 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, PolicyChunk, PolicySource,
-    PolicyStatus, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, PolicyChunk, PolicySource, PolicyStatus,
+    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
@@ -211,7 +212,7 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
-) -> Result<ProviderEnvironmentResult> {
+) -> Result<GetSandboxProviderEnvironmentResponse> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -223,11 +224,7 @@ pub async fn fetch_provider_environment(
         .await
         .into_diagnostic()?;
 
-    let inner = response.into_inner();
-    Ok(ProviderEnvironmentResult {
-        environment: inner.environment,
-        provider_env_revision: inner.provider_env_revision,
-    })
+    Ok(response.into_inner())
 }
 
 /// A reusable gRPC client for the `OpenShell` service.

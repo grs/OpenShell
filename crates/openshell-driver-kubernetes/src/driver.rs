@@ -669,6 +669,15 @@ const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
 /// Name of the init container that installs the supervisor binary.
 const SUPERVISOR_INIT_CONTAINER_NAME: &str = "openshell-supervisor-install";
 
+/// Name of the volume used to mount the SPIRE agent socket.
+const SPIRE_SOCKET_VOLUME_NAME: &str = "spire-agent-socket";
+
+/// Path on the host where the SPIRE agent socket is located.
+const SPIRE_SOCKET_HOST_PATH: &str = "/run/spire/agent-sockets";
+
+/// Path inside the container where the SPIRE socket will be mounted.
+const SPIRE_SOCKET_MOUNT_PATH: &str = "/run/spire/agent-sockets";
+
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
 /// The init container writes the binary here; the agent container reads it.
@@ -844,6 +853,86 @@ fn apply_supervisor_sideload(
             .as_array_mut();
         if let Some(volume_mounts) = volume_mounts {
             volume_mounts.push(supervisor_volume_mount());
+        }
+    }
+}
+
+/// Build the hostPath volume definition for the SPIRE agent socket.
+fn spire_socket_volume() -> serde_json::Value {
+    serde_json::json!({
+        "name": SPIRE_SOCKET_VOLUME_NAME,
+        "hostPath": {
+            "path": SPIRE_SOCKET_HOST_PATH,
+            "type": "Directory"
+        }
+    })
+}
+
+/// Build the volume mount for the SPIRE agent socket in the agent container.
+fn spire_socket_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": SPIRE_SOCKET_VOLUME_NAME,
+        "mountPath": SPIRE_SOCKET_MOUNT_PATH,
+        "readOnly": true
+    })
+}
+
+/// Apply SPIRE Workload API socket access to the pod template.
+///
+/// This injects:
+///   1. A hostPath volume pointing to the SPIRE agent socket directory
+///   2. A volume mount in the agent container
+///   3. The SPIFFE_ENDPOINT_SOCKET environment variable
+///
+/// This enables the supervisor to use SPIFFE Workload API for authentication.
+fn apply_spire_socket_access(pod_template: &mut serde_json::Value) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    // 1. Add the hostPath volume to spec.volumes
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(spire_socket_volume());
+    }
+
+    // 2. Find the agent container and add volume mount + env var
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    let mut target_index = None;
+    for (i, c) in containers.iter().enumerate() {
+        if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
+            target_index = Some(i);
+            break;
+        }
+    }
+    let index = target_index.unwrap_or(0);
+
+    if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+        // Add volume mount
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volume_mounts) = volume_mounts {
+            volume_mounts.push(spire_socket_volume_mount());
+        }
+
+        // Add SPIFFE_ENDPOINT_SOCKET environment variable (URI format)
+        let env = container
+            .entry("env")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(env) = env {
+            env.push(serde_json::json!({
+                "name": "SPIFFE_ENDPOINT_SOCKET",
+                "value": format!("unix://{}/spire-agent.sock", SPIRE_SOCKET_MOUNT_PATH)
+            }));
         }
     }
 }
@@ -1214,6 +1303,9 @@ fn sandbox_template_to_k8s(
         params.supervisor_sideload_method,
     );
 
+    // Mount SPIRE agent socket for SPIFFE Workload API access
+    apply_spire_socket_access(&mut result);
+
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling.  Skipped when the user
     // provides custom volumeClaimTemplates to avoid conflicts.
@@ -1519,12 +1611,8 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(
-            &mut pod_template,
-            "custom-image:latest",
-            "IfNotPresent",
-            SupervisorSideloadMethod::InitContainer,
-        );
+        apply_supervisor_sideload(&mut pod_template);
+        apply_spire_socket_access(&mut pod_template);
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(sc["runAsUser"], 0, "runAsUser must be 0 for supervisor");
@@ -1548,12 +1636,8 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(
-            &mut pod_template,
-            "supervisor-image:latest",
-            "IfNotPresent",
-            SupervisorSideloadMethod::InitContainer,
-        );
+        apply_supervisor_sideload(&mut pod_template);
+        apply_spire_socket_access(&mut pod_template);
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(
@@ -1573,11 +1657,13 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(
-            &mut pod_template,
-            "supervisor-image:latest",
-            "IfNotPresent",
-            SupervisorSideloadMethod::InitContainer,
+        apply_supervisor_sideload(&mut pod_template);
+        apply_spire_socket_access(&mut pod_template);
+
+        // No init containers should be present (hostPath, not emptyDir+init)
+        assert!(
+            pod_template["spec"]["initContainers"].is_null(),
+            "hostPath sideload should not create init containers"
         );
 
         // Volume should be an emptyDir

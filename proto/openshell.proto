@@ -870,10 +870,26 @@ message GetSandboxProviderEnvironmentRequest {
 
 // Get sandbox provider environment response.
 message GetSandboxProviderEnvironmentResponse {
-  // Provider credential environment variables.
-  map<string, string> environment = 1;
-  // Fingerprint for the provider credential inputs that produced environment.
-  uint64 provider_env_revision = 2;
+  // Static credential environment variables (env var name -> value).
+  map<string, string> static_environment = 1;
+
+  // Dynamic provider configurations for token retrieval.
+  repeated DynamicProviderConfig dynamic_providers = 2;
+}
+
+// Dynamic provider configuration for sandbox token retrieval.
+message DynamicProviderConfig {
+  // Provider name.
+  string provider_name = 1;
+
+  // Provider type slug.
+  string provider_type = 2;
+
+  // Environment variable names this provider serves.
+  repeated string env_keys = 3;
+
+  // Token retrieval configuration.
+  openshell.datamodel.v1.TokenProviderConfig token_config = 4;
 }
 
 // ---------------------------------------------------------------------------

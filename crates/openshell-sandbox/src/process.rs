@@ -23,7 +23,9 @@ use tokio::process::{Child, Command};
 use tracing::debug;
 
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
+    tracing::info!("inject_provider_env called with {} entries", provider_env.len());
     for (key, value) in provider_env {
+        tracing::info!("setting env: {} = {}", key, value);
         cmd.env(key, value);
     }
 }

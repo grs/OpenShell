@@ -517,10 +517,13 @@ pub(super) async fn compute_provider_env_revision(
                 })?;
                 hasher.update(provider.r#type.as_bytes());
 
-                let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
-                credential_keys.sort();
-                for key in credential_keys {
-                    hasher.update(key.as_bytes());
+                // Hash static credentials if present
+                if let Some(openshell_core::proto::provider::ProviderConfig::Static(static_creds)) = &provider.provider_config {
+                    let mut credential_keys: Vec<_> = static_creds.credentials.keys().collect();
+                    credential_keys.sort();
+                    for key in credential_keys {
+                        hasher.update(key.as_bytes());
+                    }
                 }
             }
             None => {
@@ -622,25 +625,19 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .spec
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-    let provider_names = spec.providers;
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
+    let response =
+        super::provider::resolve_provider_environment(state.store.as_ref(), &spec.providers)
             .await?;
 
     info!(
         sandbox_id = %sandbox_id,
-        provider_count = provider_names.len(),
-        env_count = environment.len(),
-        provider_env_revision,
+        provider_count = spec.providers.len(),
+        static_env_count = response.static_environment.len(),
+        dynamic_provider_count = response.dynamic_providers.len(),
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
-    Ok(Response::new(GetSandboxProviderEnvironmentResponse {
-        environment,
-        provider_env_revision,
-    }))
+    Ok(Response::new(response))
 }
 
 // ---------------------------------------------------------------------------

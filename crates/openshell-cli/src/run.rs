@@ -79,6 +79,17 @@ fn phase_name(phase: i32) -> &'static str {
     }
 }
 
+/// Helper to extract static credentials from a Provider.
+fn get_credentials(
+    provider: &Provider,
+) -> std::collections::HashMap<String, String> {
+    use openshell_core::proto::provider::ProviderConfig;
+    match &provider.provider_config {
+        Some(ProviderConfig::Static(static_creds)) => static_creds.credentials.clone(),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 fn ready_false_condition_message(
     status: Option<&openshell_core::proto::SandboxStatus>,
 ) -> Option<String> {
@@ -3092,7 +3103,11 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     for provider in providers {
         let provider_name = provider.object_name();
         let provider_type = &provider.r#type;
-        let credential_keys = provider.credentials.len();
+        let credential_keys = match &provider.provider_config {
+            Some(openshell_core::proto::provider::ProviderConfig::Static(creds)) => creds.credentials.len(),
+            Some(openshell_core::proto::provider::ProviderConfig::Token(_)) => 0,
+            None => 0,
+        };
         let config_keys = provider.config.len();
         let _ = writeln!(
             output,
@@ -3364,7 +3379,11 @@ async fn auto_create_provider(
                     labels: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
-                credentials: discovered.credentials.clone(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: discovered.credentials.clone(),
+                    },
+                )),
                 config: discovered.config.clone(),
             }),
         };
@@ -3404,7 +3423,11 @@ async fn auto_create_provider(
                         labels: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
-                    credentials: discovered.credentials.clone(),
+                    provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                        openshell_core::proto::StaticCredentials {
+                            credentials: discovered.credentials.clone(),
+                        },
+                    )),
                     config: discovered.config.clone(),
                 }),
             };
@@ -3738,13 +3761,50 @@ pub async fn provider_create(
     provider_type: &str,
     from_existing: bool,
     credentials: &[String],
+    obtain_oauth_token: bool,
+    token_service_url: Option<&str>,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+    audience: Option<&str>,
+    scopes: &[String],
+    env_keys: &[String],
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
-    if from_existing && !credentials.is_empty() {
+    // Validate: exactly one of static/from_existing/oauth modes
+    let mode_count = [from_existing, !credentials.is_empty(), obtain_oauth_token]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    if mode_count > 1 {
         return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential"
+            "cannot combine --from-existing, --credential, and --obtain-oauth-token"
         ));
+    }
+
+    // Validate OAuth2 mode requirements
+    if obtain_oauth_token {
+        if audience.is_none() {
+            return Err(miette::miette!("--audience is required with --obtain-oauth-token"));
+        }
+        if env_keys.is_empty() {
+            return Err(miette::miette!("at least one --env-key is required with --obtain-oauth-token"));
+        }
+
+        // Validate client credentials: both or neither
+        match (client_id, client_secret) {
+            (Some(_), None) => {
+                return Err(miette::miette!("--client-secret is required when --client-id is specified"));
+            }
+            (None, Some(_)) => {
+                return Err(miette::miette!("--client-id is required when --client-secret is specified"));
+            }
+            (Some(_), Some(_)) if token_service_url.is_none() => {
+                return Err(miette::miette!("--client-id and --client-secret can only be used with --token-service-url"));
+            }
+            _ => {}
+        }
     }
 
     let mut client = grpc_client(server, tls).await?;
@@ -3777,34 +3837,90 @@ pub async fn provider_create(
         }
     };
 
-    let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
-    if from_existing {
-        let registry = ProviderRegistry::new();
-        let discovered = registry
-            .discover_existing(&provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
-        let Some(discovered) = discovered else {
-            return Err(miette::miette!(
-                "no existing local credentials/config found for provider type '{provider_type}'"
-            ));
+    // Build the provider configuration based on mode
+    let provider_config = if obtain_oauth_token {
+        // OAuth2 token provider
+        use openshell_core::proto::{
+            token_provider_config, user_provided_token_service, ClientCredentials,
+            TokenProviderConfig, UserProvidedTokenService,
         };
 
-        for (key, value) in discovered.credentials {
-            credential_map.entry(key).or_insert(value);
-        }
-        for (key, value) in discovered.config {
-            config_map.entry(key).or_insert(value);
-        }
-    }
+        let service_config = if let Some(url) = token_service_url {
+            // User-provided token service
+            let authentication = match (client_id, client_secret) {
+                (Some(id), Some(secret)) => {
+                    // Client credentials auth
+                    Some(user_provided_token_service::Authentication::ClientCredentials(
+                        ClientCredentials {
+                            client_id: id.to_string(),
+                            client_secret: secret.to_string(),
+                        }
+                    ))
+                }
+                _ => {
+                    // SPIFFE auth
+                    Some(user_provided_token_service::Authentication::UseSpiffe(true))
+                }
+            };
 
-    if credential_map.is_empty() {
-        return Err(miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
-        ));
-    }
+            Some(token_provider_config::ServiceConfig::UserProvided(
+                UserProvidedTokenService {
+                    token_endpoint: url.to_string(),
+                    authentication,
+                }
+            ))
+        } else {
+            // Use backend default service
+            Some(token_provider_config::ServiceConfig::UseBackendDefault(true))
+        };
+
+        Some(openshell_core::proto::provider::ProviderConfig::Token(
+            TokenProviderConfig {
+                service_config,
+                audience: audience.unwrap().to_string(), // Already validated above
+                scopes: scopes.to_vec(),
+                env_keys: env_keys.to_vec(),
+                metadata: HashMap::new(),
+            }
+        ))
+    } else {
+        // Static credentials provider
+        let mut credential_map = parse_credential_pairs(credentials)?;
+
+        if from_existing {
+            let registry = ProviderRegistry::new();
+            let discovered = registry
+                .discover_existing(&provider_type)
+                .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+            let Some(discovered) = discovered else {
+                return Err(miette::miette!(
+                    "no existing local credentials/config found for provider type '{provider_type}'"
+                ));
+            };
+
+            for (key, value) in discovered.credentials {
+                credential_map.entry(key).or_insert(value);
+            }
+            for (key, value) in discovered.config {
+                config_map.entry(key).or_insert(value);
+            }
+        }
+
+        if credential_map.is_empty() {
+            return Err(miette::miette!(
+                "no credentials resolved for provider type '{provider_type}'. \
+                 Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+            ));
+        }
+
+        Some(openshell_core::proto::provider::ProviderConfig::Static(
+            openshell_core::proto::StaticCredentials {
+                credentials: credential_map,
+            }
+        ))
+    };
 
     let response = client
         .create_provider(CreateProviderRequest {
@@ -3815,8 +3931,8 @@ pub async fn provider_create(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: provider_type.clone(),
-                credentials: credential_map,
+                r#type: provider_type,
+                provider_config,
                 config: config_map,
             }),
         })
@@ -3850,7 +3966,8 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
         .provider
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
 
-    let credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+    let credentials = get_credentials(&provider);
+    let credential_keys = credentials.keys().cloned().collect::<Vec<_>>();
     let config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
 
     println!("{}", "Provider:".cyan().bold());
@@ -3930,11 +4047,12 @@ pub async fn provider_list(
     );
 
     for provider in providers {
+        let credentials = get_credentials(&provider);
         println!(
             "{:<name_width$}  {:<type_width$}  {:<16}  {}",
             provider.object_name().to_string(),
             provider.r#type,
-            provider.credentials.len(),
+            credentials.len(),
             provider.config.len(),
         );
     }
@@ -4316,7 +4434,11 @@ pub async fn provider_update(
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: credential_map,
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: credential_map,
+                    },
+                )),
                 config: config_map,
             }),
         })

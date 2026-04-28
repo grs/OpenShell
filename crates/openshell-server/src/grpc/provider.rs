@@ -15,6 +15,52 @@ use super::validation::validate_provider_fields;
 use super::{MAX_PAGE_SIZE, clamp_limit};
 
 // ---------------------------------------------------------------------------
+// Backend default token service configuration
+// ---------------------------------------------------------------------------
+
+/// Get the gateway's default token service configuration from environment.
+///
+/// Environment variables:
+/// - `OPENSHELL_TOKEN_SERVICE_ENDPOINT`: Token endpoint URL (required)
+/// - `OPENSHELL_TOKEN_SERVICE_CLIENT_ID`: Client ID for client credentials auth (optional)
+/// - `OPENSHELL_TOKEN_SERVICE_CLIENT_SECRET`: Client secret for client credentials auth (optional)
+///
+/// If client_id and client_secret are not provided, SPIFFE authentication is used.
+fn get_default_token_service() -> Result<openshell_core::proto::UserProvidedTokenService, String> {
+    use openshell_core::proto::{user_provided_token_service, ClientCredentials, UserProvidedTokenService};
+
+    let endpoint = std::env::var("OPENSHELL_TOKEN_SERVICE_ENDPOINT")
+        .map_err(|_| "OPENSHELL_TOKEN_SERVICE_ENDPOINT not set".to_string())?;
+
+    if endpoint.trim().is_empty() {
+        return Err("OPENSHELL_TOKEN_SERVICE_ENDPOINT cannot be empty".to_string());
+    }
+
+    let authentication = match (
+        std::env::var("OPENSHELL_TOKEN_SERVICE_CLIENT_ID").ok(),
+        std::env::var("OPENSHELL_TOKEN_SERVICE_CLIENT_SECRET").ok(),
+    ) {
+        (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => {
+            Some(user_provided_token_service::Authentication::ClientCredentials(
+                ClientCredentials {
+                    client_id: id,
+                    client_secret: secret,
+                }
+            ))
+        }
+        _ => {
+            // Use SPIFFE authentication
+            Some(user_provided_token_service::Authentication::UseSpiffe(true))
+        }
+    };
+
+    Ok(UserProvidedTokenService {
+        token_endpoint: endpoint,
+        authentication,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // CRUD helpers
 // ---------------------------------------------------------------------------
 
@@ -23,8 +69,20 @@ use super::{MAX_PAGE_SIZE, clamp_limit};
 /// and key listings.  Internal server paths (inference routing, sandbox env
 /// injection) read credentials from the store directly and are unaffected.
 fn redact_provider_credentials(mut provider: Provider) -> Provider {
-    for value in provider.credentials.values_mut() {
-        *value = "REDACTED".to_string();
+    use openshell_core::proto::provider::ProviderConfig;
+
+    if let Some(config) = &mut provider.provider_config {
+        match config {
+            ProviderConfig::Static(static_creds) => {
+                for value in static_creds.credentials.values_mut() {
+                    *value = "REDACTED".to_string();
+                }
+            }
+            ProviderConfig::Token(_) => {
+                // Dynamic token config has no secrets to redact
+                // (token endpoint, audience, scopes are all non-secret)
+            }
+        }
     }
     provider
 }
@@ -34,6 +92,7 @@ pub(super) async fn create_provider_record(
     mut provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectName, current_time_ms};
+    use openshell_core::proto::provider::ProviderConfig;
 
     // Initialize metadata if not present
     if provider.metadata.is_none() {
@@ -62,10 +121,57 @@ pub(super) async fn create_provider_record(
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
-    if provider.credentials.is_empty() {
-        return Err(Status::invalid_argument(
-            "provider.credentials must not be empty",
-        ));
+
+    // Validate provider configuration
+    match &provider.provider_config {
+        None => {
+            return Err(Status::invalid_argument(
+                "provider.provider_config is required (either static or token)",
+            ));
+        }
+        Some(ProviderConfig::Static(static_creds)) => {
+            if static_creds.credentials.is_empty() {
+                return Err(Status::invalid_argument(
+                    "static provider credentials must not be empty",
+                ));
+            }
+        }
+        Some(ProviderConfig::Token(token_config)) => {
+            use openshell_core::proto::token_provider_config::ServiceConfig;
+            use openshell_core::proto::user_provided_token_service::Authentication;
+
+            // Audience is always required
+            if token_config.audience.trim().is_empty() {
+                return Err(Status::invalid_argument("audience is required"));
+            }
+
+            // Service config is required
+            match &token_config.service_config {
+                None => {
+                    return Err(Status::invalid_argument(
+                        "service_config is required (either user_provided or use_backend_default)"
+                    ));
+                }
+                Some(ServiceConfig::UserProvided(service)) => {
+                    if service.token_endpoint.trim().is_empty() {
+                        return Err(Status::invalid_argument("token_endpoint is required"));
+                    }
+                    // Authentication is optional - defaults to SPIFFE if not specified
+                    if let Some(Authentication::ClientCredentials(creds)) = &service.authentication {
+                        if creds.client_id.trim().is_empty() {
+                            return Err(Status::invalid_argument("client_id cannot be empty"));
+                        }
+                        if creds.client_secret.trim().is_empty() {
+                            return Err(Status::invalid_argument("client_secret cannot be empty"));
+                        }
+                    }
+                }
+                Some(ServiceConfig::UseBackendDefault(_)) => {
+                    // TODO: Validate that gateway has default token service configured
+                    // For now, we'll check this at resolution time
+                }
+            }
+        }
     }
 
     // Validate field sizes before any I/O.
@@ -126,6 +232,7 @@ pub(super) async fn update_provider_record(
     provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::ObjectName;
+    use openshell_core::proto::provider::ProviderConfig;
 
     if provider.object_name().is_empty() {
         return Err(Status::invalid_argument("provider.name is required"));
@@ -149,10 +256,40 @@ pub(super) async fn update_provider_record(
         ));
     }
 
+    // Merge provider configuration
+    let provider_config = match (existing.provider_config, provider.provider_config) {
+        (None, None) => None,
+        (Some(existing_config), None) => Some(existing_config),
+        (None, Some(incoming_config)) => Some(incoming_config),
+        (Some(existing_config), Some(incoming_config)) => {
+            // Both exist - merge based on variant
+            match (existing_config, incoming_config) {
+                (ProviderConfig::Static(mut existing_static), ProviderConfig::Static(incoming_static)) => {
+                    // Merge static credentials
+                    existing_static.credentials = merge_map(
+                        existing_static.credentials,
+                        incoming_static.credentials,
+                    );
+                    Some(ProviderConfig::Static(existing_static))
+                }
+                (ProviderConfig::Token(_), ProviderConfig::Token(incoming_token)) => {
+                    // Replace token config entirely (no partial merge semantics for token endpoints)
+                    Some(ProviderConfig::Token(incoming_token))
+                }
+                (_existing_config, _incoming_config) => {
+                    // Mismatched variants - cannot change provider mode
+                    return Err(Status::invalid_argument(
+                        "cannot change provider configuration mode (static <-> token); delete and recreate",
+                    ));
+                }
+            }
+        }
+    };
+
     let updated = Provider {
         metadata: existing.metadata,
         r#type: existing.r#type,
-        credentials: merge_map(existing.credentials, provider.credentials),
+        provider_config,
         config: merge_map(existing.config, provider.config),
     };
 
@@ -254,18 +391,25 @@ fn merge_map(
 /// Resolve provider credentials into environment variables.
 ///
 /// For each provider name in the list, fetches the provider from the store and
-/// collects credential key-value pairs. Returns a map of environment variables
-/// to inject into the sandbox. When duplicate keys appear across providers, the
-/// first provider's value wins.
+/// returns either static credentials (as env var map) or dynamic provider
+/// configurations (for token retrieval). Static credentials are returned as a
+/// HashMap for direct injection; dynamic providers return configuration for the
+/// sandbox supervisor to fetch tokens on-demand using platform credentials.
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
-) -> Result<std::collections::HashMap<String, String>, Status> {
+) -> Result<openshell_core::proto::GetSandboxProviderEnvironmentResponse, Status> {
+    use openshell_core::proto::{DynamicProviderConfig, provider::ProviderConfig};
+
     if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(openshell_core::proto::GetSandboxProviderEnvironmentResponse::default());
     }
 
-    let mut env = std::collections::HashMap::new();
+    let mut static_environment = std::collections::HashMap::new();
+    let mut dynamic_providers = Vec::new();
+
+    // Load provider registry for inferring env keys
+    let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
         let provider = store
@@ -274,20 +418,90 @@ pub(super) async fn resolve_provider_environment(
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
-        for (key, value) in &provider.credentials {
-            if is_valid_env_key(key) {
-                env.entry(key.clone()).or_insert_with(|| value.clone());
-            } else {
+        let provider_name = provider.object_name().to_string();
+        let provider_type = provider.r#type.clone();
+
+        match provider.provider_config {
+            Some(ProviderConfig::Static(static_creds)) => {
+                // Static credentials - return as environment variables
+                for (key, value) in &static_creds.credentials {
+                    if is_valid_env_key(key) {
+                        static_environment.entry(key.clone()).or_insert_with(|| value.clone());
+                    } else {
+                        warn!(
+                            provider_name = %name,
+                            key = %key,
+                            "skipping credential with invalid env var key"
+                        );
+                    }
+                }
+            }
+            Some(ProviderConfig::Token(mut token_config)) => {
+                use openshell_core::proto::token_provider_config::ServiceConfig;
+
+                // Resolve backend default if needed
+                if matches!(token_config.service_config, Some(ServiceConfig::UseBackendDefault(_))) {
+                    match get_default_token_service() {
+                        Ok(default_service) => {
+                            token_config.service_config = Some(ServiceConfig::UserProvided(default_service));
+                        }
+                        Err(e) => {
+                            return Err(Status::failed_precondition(format!(
+                                "provider '{}' uses backend default token service but none is configured: {}",
+                                name, e
+                            )));
+                        }
+                    }
+                }
+
+                // Dynamic token provider - resolve env_keys
+                let env_keys = if token_config.env_keys.is_empty() {
+                    // Infer from provider type using ProviderRegistry
+                    if let Some(plugin) = registry.get(&provider_type) {
+                        plugin.credential_env_vars()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    } else {
+                        warn!(
+                            provider_name = %name,
+                            provider_type = %provider_type,
+                            "unknown provider type, no env keys will be inferred"
+                        );
+                        Vec::new()
+                    }
+                } else {
+                    // Use explicit env_keys
+                    token_config.env_keys.clone()
+                };
+
+                tracing::info!(
+                    provider_name = %provider_name,
+                    provider_type = %provider_type,
+                    env_keys = ?env_keys,
+                    "adding dynamic provider to sandbox environment"
+                );
+
+                dynamic_providers.push(DynamicProviderConfig {
+                    provider_name,
+                    provider_type,
+                    env_keys,
+                    token_config: Some(token_config),
+                });
+            }
+            None => {
                 warn!(
                     provider_name = %name,
-                    key = %key,
-                    "skipping credential with invalid env var key"
+                    "provider has no configuration (neither static nor dynamic)"
                 );
             }
         }
     }
 
-    Ok(env)
+    Ok(openshell_core::proto::GetSandboxProviderEnvironmentResponse {
+        static_environment,
+        dynamic_providers,
+    })
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -788,6 +1002,13 @@ mod tests {
         assert!(!is_valid_env_key("X;rm -rf /"));
     }
 
+    fn get_credentials(provider: &Provider) -> &std::collections::HashMap<String, String> {
+        match provider.provider_config.as_ref().expect("provider_config missing") {
+            openshell_core::proto::provider::ProviderConfig::Static(s) => &s.credentials,
+            _ => panic!("expected static credentials"),
+        }
+    }
+
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -797,12 +1018,16 @@ mod tests {
                 labels: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
-            credentials: [
-                ("API_TOKEN".to_string(), "token-123".to_string()),
-                ("SECONDARY".to_string(), "secondary-token".to_string()),
-            ]
-            .into_iter()
-            .collect(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: [
+                        ("API_TOKEN".to_string(), "token-123".to_string()),
+                        ("SECONDARY".to_string(), "secondary-token".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }
+            )),
             config: [
                 ("endpoint".to_string(), "https://example.com".to_string()),
                 ("region".to_string(), "us-west".to_string()),
@@ -1399,11 +1624,15 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
-                credentials: std::iter::once((
-                    "API_TOKEN".to_string(),
-                    "rotated-token".to_string(),
-                ))
-                .collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once((
+                            "API_TOKEN".to_string(),
+                            "rotated-token".to_string(),
+                        ))
+                        .collect(),
+                    }
+                )),
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
             },
@@ -1411,14 +1640,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(updated.object_id(), provider_id);
-        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(get_credentials(&updated).len(), 2);
         assert_eq!(
-            updated.credentials.get("API_TOKEN"),
+            get_credentials(&updated).get("API_TOKEN"),
             Some(&"REDACTED".to_string()),
             "credential values must be redacted in gRPC responses"
         );
         assert_eq!(
-            updated.credentials.get("SECONDARY"),
+            get_credentials(&updated).get("SECONDARY"),
             Some(&"REDACTED".to_string()),
         );
         let stored: Provider = store
@@ -1426,12 +1655,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let stored_creds = match stored.provider_config.as_ref().unwrap() {
+            openshell_core::proto::provider::ProviderConfig::Static(s) => &s.credentials,
+            _ => panic!("expected static credentials"),
+        };
         assert_eq!(
-            stored.credentials.get("API_TOKEN"),
+            stored_creds.get("API_TOKEN"),
             Some(&"rotated-token".to_string())
         );
         assert_eq!(
-            stored.credentials.get("SECONDARY"),
+            stored_creds.get("SECONDARY"),
             Some(&"secondary-token".to_string())
         );
         assert_eq!(
@@ -1509,7 +1742,11 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: HashMap::new(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: HashMap::new(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1533,7 +1770,11 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: HashMap::new(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: HashMap::new(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1561,7 +1802,11 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: HashMap::new(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: HashMap::new(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1570,9 +1815,9 @@ mod tests {
 
         assert_eq!(updated.object_id(), persisted.object_id());
         assert_eq!(updated.r#type, "nvidia");
-        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(get_credentials(&updated).len(), 2);
         assert_eq!(
-            updated.credentials.get("API_TOKEN"),
+            get_credentials(&updated).get("API_TOKEN"),
             Some(&"REDACTED".to_string())
         );
         assert_eq!(updated.config.len(), 2);
@@ -1586,7 +1831,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.credentials.len(), 2);
+        assert_eq!(get_credentials(&stored).len(), 2);
     }
 
     #[tokio::test]
@@ -1608,19 +1853,23 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
+                    }
+                )),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
             },
         )
         .await
         .unwrap();
 
-        assert_eq!(updated.credentials.len(), 1);
+        assert_eq!(get_credentials(&updated).len(), 1);
         assert_eq!(
-            updated.credentials.get("API_TOKEN"),
+            get_credentials(&updated).get("API_TOKEN"),
             Some(&"REDACTED".to_string())
         );
-        assert!(!updated.credentials.contains_key("SECONDARY"));
+        assert!(get_credentials(&updated).get("SECONDARY").is_none());
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
@@ -1632,12 +1881,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.credentials.len(), 1);
+        assert_eq!(get_credentials(&stored).len(), 1);
         assert_eq!(
-            stored.credentials.get("API_TOKEN"),
+            get_credentials(&stored).get("API_TOKEN"),
             Some(&"token-123".to_string())
         );
-        assert!(!stored.credentials.contains_key("SECONDARY"));
+        assert!(get_credentials(&stored).get("SECONDARY").is_none());
     }
 
     #[tokio::test]
@@ -1659,7 +1908,11 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: HashMap::new(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: HashMap::new(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1688,7 +1941,11 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
-                credentials: HashMap::new(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: HashMap::new(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1719,7 +1976,11 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
-                credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1733,7 +1994,8 @@ mod tests {
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.static_environment.is_empty());
+        assert!(result.dynamic_providers.is_empty());
     }
 
     #[tokio::test]
@@ -1747,12 +2009,16 @@ mod tests {
                 labels: HashMap::new(),
             }),
             r#type: "claude".to_string(),
-            credentials: [
-                ("ANTHROPIC_API_KEY".to_string(), "sk-abc".to_string()),
-                ("CLAUDE_API_KEY".to_string(), "sk-abc".to_string()),
-            ]
-            .into_iter()
-            .collect(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: [
+                        ("ANTHROPIC_API_KEY".to_string(), "sk-abc".to_string()),
+                        ("CLAUDE_API_KEY".to_string(), "sk-abc".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }
+            )),
             config: std::iter::once((
                 "endpoint".to_string(),
                 "https://api.anthropic.com".to_string(),
@@ -1764,9 +2030,9 @@ mod tests {
         let result = resolve_provider_environment(&store, &["claude-local".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
-        assert!(!result.contains_key("endpoint"));
+        assert_eq!(result.static_environment.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
+        assert_eq!(result.static_environment.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
+        assert!(!result.static_environment.contains_key("endpoint"));
     }
 
     #[tokio::test]
@@ -1790,13 +2056,17 @@ mod tests {
                 labels: HashMap::new(),
             }),
             r#type: "test".to_string(),
-            credentials: [
-                ("VALID_KEY".to_string(), "value".to_string()),
-                ("nested.api_key".to_string(), "should-skip".to_string()),
-                ("bad-key".to_string(), "should-skip".to_string()),
-            ]
-            .into_iter()
-            .collect(),
+            provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                openshell_core::proto::StaticCredentials {
+                    credentials: [
+                        ("VALID_KEY".to_string(), "value".to_string()),
+                        ("nested.api_key".to_string(), "should-skip".to_string()),
+                        ("bad-key".to_string(), "should-skip".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }
+            )),
             config: HashMap::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
@@ -1804,9 +2074,9 @@ mod tests {
         let result = resolve_provider_environment(&store, &["test-provider".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
-        assert!(!result.contains_key("nested.api_key"));
-        assert!(!result.contains_key("bad-key"));
+        assert_eq!(result.static_environment.get("VALID_KEY"), Some(&"value".to_string()));
+        assert!(!result.static_environment.contains_key("nested.api_key"));
+        assert!(!result.static_environment.contains_key("bad-key"));
     }
 
     #[tokio::test]
@@ -1822,11 +2092,15 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
-                credentials: std::iter::once((
-                    "ANTHROPIC_API_KEY".to_string(),
-                    "sk-abc".to_string(),
-                ))
-                .collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once((
+                            "ANTHROPIC_API_KEY".to_string(),
+                            "sk-abc".to_string(),
+                        ))
+                        .collect(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1842,8 +2116,12 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
-                credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
-                    .collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
+                            .collect(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1856,8 +2134,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
+        assert_eq!(result.static_environment.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
+        assert_eq!(result.static_environment.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
     }
 
     #[tokio::test]
@@ -1873,8 +2151,12 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
-                credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
-                    .collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
+                            .collect(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1890,11 +2172,15 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
-                credentials: std::iter::once((
-                    "SHARED_KEY".to_string(),
-                    "second-value".to_string(),
-                ))
-                .collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once((
+                            "SHARED_KEY".to_string(),
+                            "second-value".to_string(),
+                        ))
+                        .collect(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1907,7 +2193,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("SHARED_KEY"), Some(&"first-value".to_string()));
+        assert_eq!(result.static_environment.get("SHARED_KEY"), Some(&"first-value".to_string()));
     }
 
     #[tokio::test]
@@ -1926,11 +2212,15 @@ mod tests {
                     labels: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
-                credentials: std::iter::once((
-                    "ANTHROPIC_API_KEY".to_string(),
-                    "sk-test".to_string(),
-                ))
-                .collect(),
+                provider_config: Some(openshell_core::proto::provider::ProviderConfig::Static(
+                    openshell_core::proto::StaticCredentials {
+                        credentials: std::iter::once((
+                            "ANTHROPIC_API_KEY".to_string(),
+                            "sk-test".to_string(),
+                        ))
+                        .collect(),
+                    }
+                )),
                 config: HashMap::new(),
             },
         )
@@ -1964,7 +2254,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(env.static_environment.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
     }
 
     #[tokio::test]
@@ -1997,7 +2287,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(env.is_empty());
+        assert!(env.static_environment.is_empty());
+        assert!(env.dynamic_providers.is_empty());
     }
 
     #[tokio::test]

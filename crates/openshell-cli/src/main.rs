@@ -681,7 +681,13 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(
+        group = clap::ArgGroup::new("provider_mode")
+            .required(true)
+            .args(["from_existing", "credentials", "obtain_oauth_token"]),
+        help_template = LEAF_HELP_TEMPLATE,
+        next_help_heading = "FLAGS"
+    )]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -691,17 +697,60 @@ enum ProviderCommands {
         #[arg(long = "type")]
         provider_type: String,
 
+        // ── Static credential options ──
+
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "obtain_oauth_token"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with = "from_existing"
+            conflicts_with_all = ["from_existing", "obtain_oauth_token"]
         )]
         credentials: Vec<String>,
+
+        // ── OAuth2 token options ──
+
+        /// Use OAuth2 token exchange instead of static credentials.
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials"])]
+        obtain_oauth_token: bool,
+
+        /// OAuth2 token service endpoint URL.
+        /// If omitted, uses the gateway's default token service.
+        #[arg(long, requires = "obtain_oauth_token")]
+        token_service_url: Option<String>,
+
+        /// OAuth2 client ID for token endpoint authentication.
+        /// Must be provided with --client-secret, or both omitted to use SPIFFE.
+        /// Cannot be used without --token-service-url.
+        #[arg(long, requires = "token_service_url")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret for token endpoint authentication.
+        /// Must be provided with --client-id, or both omitted to use SPIFFE.
+        /// Cannot be used without --token-service-url.
+        #[arg(long, requires = "token_service_url")]
+        client_secret: Option<String>,
+
+        /// Token audience (aud claim).
+        /// Required when using --obtain-oauth-token.
+        #[arg(long, requires = "obtain_oauth_token")]
+        audience: Option<String>,
+
+        /// OAuth2 scopes (can be specified multiple times).
+        /// Only valid with --obtain-oauth-token.
+        #[arg(long = "scope", requires = "obtain_oauth_token")]
+        scopes: Vec<String>,
+
+        /// Environment variable names this provider serves (can be specified multiple times).
+        /// Required when using --obtain-oauth-token.
+        /// If not provided with static credentials, inferred from provider type (e.g., github → GITHUB_TOKEN, GH_TOKEN).
+        #[arg(long = "env-key")]
+        env_keys: Vec<String>,
+
+        // ── Common options ──
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -2622,6 +2671,13 @@ async fn main() -> Result<()> {
                     provider_type,
                     from_existing,
                     credentials,
+                    obtain_oauth_token,
+                    token_service_url,
+                    client_id,
+                    client_secret,
+                    audience,
+                    scopes,
+                    env_keys,
                     config,
                 } => {
                     run::provider_create(
@@ -2630,6 +2686,13 @@ async fn main() -> Result<()> {
                         provider_type.as_str(),
                         from_existing,
                         &credentials,
+                        obtain_oauth_token,
+                        token_service_url.as_deref(),
+                        client_id.as_deref(),
+                        client_secret.as_deref(),
+                        audience.as_deref(),
+                        &scopes,
+                        &env_keys,
                         &config,
                         &tls,
                     )
